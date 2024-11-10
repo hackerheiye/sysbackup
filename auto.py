@@ -133,8 +133,8 @@ def compare_and_backup(local_path, remote_name, remote_path, local_md5, remote_m
         else:
             print(f"文件 MD5 值 {local_md5_value} 匹配，跳过备份。")
 def main():
-    logging.info("Rclone 备份工具开始运行。")
-    print("Rclone 备份工具")
+    logging.info("备份工具开始运行。")
+    print("备份工具")
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rclone.conf")
     config = load_config(config_path)
 
