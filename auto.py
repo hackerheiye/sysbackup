@@ -4,10 +4,9 @@ import hashlib
 from pathlib import Path
 import time
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-# 配置日志
+# 配置日志级别为 DEBUG
 logging.basicConfig(filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'log.log'),
-                    level=logging.INFO,
+                    level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 def obscure_password(password):
@@ -26,15 +25,14 @@ def run_rclone_command(args):
     rclone_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rclone.exe')
     try:
         result = subprocess.run([rclone_path] + args, capture_output=True, text=True, encoding='utf-8')
-        result.check_returncode()  # 这将引发 CalledProcessError 如果返回码非零
-        logging.info("rclone 命令执行成功。\n标准输出:\n%s", result.stdout)
+        result.check_returncode()
+        logging.info("rclone 命令执行成功。")
         return result
     except subprocess.CalledProcessError as e:
-        logging.error("rclone 命令执行失败：返回状态码 %s。\n标准输出:\n%s\n标准错误输出:\n%s",
-                      e.returncode, e.stdout, e.stderr)
+        logging.error(f"rclone 命令执行失败：{e.returncode}，错误信息：{e.stderr}")
         return None
     except Exception as e:
-        logging.error("运行 rclone 命令时发生异常：%s", e)
+        logging.error(f"运行 rclone 命令时发生异常：{e}")
         return None
 
 def load_config(config_path):
@@ -84,76 +82,123 @@ def create_config(remote_name, config_data, append=False):
         print("配置文件已追加。")
     else:
         print("配置文件已创建。")
+def ensure_remote_dirs(remote_name, local_path, remote_base_path):
+    """确保远程目录结构与本地目录结构相匹配"""
+    # 确保 local_path 是一个目录
+    if not os.path.isdir(local_path):
+        logging.error(f"提供的本地路径不是一个目录：{local_path}")
+        return
 
+    for root, dirs, files in os.walk(local_path):
+        # 构建当前处理的远程目录路径
+        remote_dir_path = os.path.normpath(os.path.join(remote_base_path, os.path.relpath(root, local_path)))
+        
+        # 确保路径以目录分隔符结尾
+        if not remote_dir_path.endswith(os.sep):
+            remote_dir_path += os.sep
+        
+        # 打印日志以调试路径问题
+        logging.debug(f"正在检查远程目录: {remote_dir_path}")
+        
+        # 确保远程目录存在
+        ensure_remote_dir_exists(remote_name, remote_dir_path)
 
-def calculate_md5_for_file(file_path):
-    """计算单个文件的 MD5 值"""
-    with open(file_path, 'rb') as f:
-        md5 = hashlib.md5()
-        while chunk := f.read(4096):
-            md5.update(chunk)
-    return md5.hexdigest(), file_path
+        # 遍历所有文件，确保文件的父目录也被创建
+        for file in files:
+            local_file_path = os.path.join(root, file)
+            file_dir_path = os.path.dirname(local_file_path)
+            relative_file_dir_path = os.path.relpath(file_dir_path, local_path)
+            remote_file_dir_path = os.path.normpath(os.path.join(remote_base_path, relative_file_dir_path))
+            
+            # 确保路径以目录分隔符结尾
+            if not remote_file_dir_path.endswith(os.sep):
+                remote_file_dir_path += os.sep
+            
+            # 打印日志以调试路径问题
+            logging.debug(f"正在检查远程目录: {remote_file_dir_path}")
+            
+            # 确保远程目录存在
+            ensure_remote_dir_exists(remote_name, remote_file_dir_path)
+
+def ensure_remote_dir_exists(remote_name, remote_path):
+    """确保远程目录存在，如果不存在则创建"""
+    logging.debug("进入 ensure_remote_dir_exists 函数")
+    
+    # 确保路径以目录分隔符结尾
+    if not remote_path.endswith(os.sep):
+        remote_path = remote_path + os.sep
+
+    # 打印远程路径以调试
+    logging.debug(f"准备创建远程目录: {remote_path}")
+
+    try:
+        # 使用 rclone mkdir 命令创建远程目录
+        result = run_rclone_command(['mkdir', f'{remote_name}:{remote_path}'])
+        if result.returncode == 0:
+            logging.info(f"远程目录 {remote_path} 已存在或已成功创建。")
+        else:
+            logging.error(f"创建远程目录 {remote_path} 失败：{result.stderr}")
+    except Exception as e:
+        logging.error(f"检查或创建远程目录时发生异常：{e}")
+    finally:
+        logging.debug("离开 ensure_remote_dir_exists 函数")
 
 def calculate_local_md5(path):
-    """并发计算本地文件的 MD5 值"""
+    """计算本地文件的 MD5 值"""
     md5_dict = {}
-    with ThreadPoolExecutor() as executor:
-        future_to_file = {executor.submit(calculate_md5_for_file, os.path.join(root, file)): (root, file)
-                          for root, _, files in os.walk(path) for file in files}
-        for future in as_completed(future_to_file):
-            root, file = future_to_file[future]
-            try:
-                md5_value, file_path = future.result()
-                logging.info(f"本地文件MD5：{file_path} - {md5_value}")
-            except Exception as exc:
-                logging.error(f"{os.path.join(root, file)} 生成 MD5 时发生错误: {exc}")
-            else:
-                md5_dict[md5_value] = os.path.join(root, file)
+    for root, dirs, files in os.walk(path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            with open(file_path, 'rb') as f:
+                md5 = hashlib.md5()
+                while chunk := f.read(4096):
+                    md5.update(chunk)
+                md5_dict[md5.hexdigest()] = file_path
     return md5_dict
 
 def get_remote_md5(remote_name, remote_path):
     """获取远程文件的 MD5 值"""
     if not remote_name or not remote_path:
-        logging.warning("远程存储名称或路径为空。")
+        print("远程存储名称或路径为空。")
         return {}
-    logging.info("开始获取远程文件MD5...")
-    result = run_rclone_command(['hashsum', 'MD5', '--transfers=16', remote_name + ':' + remote_path])
+    result = run_rclone_command(['hashsum', 'MD5', '--checksum', '--transfers=30', remote_name + ':' + remote_path])
     if result is None or result.returncode != 0:
-        logging.error("无法获取远程文件的 MD5 值。")
+        # 命令执行失败，返回一个空字典或执行其他操作
+        print("无法获取远程文件的 MD5 值。")
         return {}
     output = result.stdout
     if not output.strip():
-        logging.warning("远程路径可能不存在或为空。")
+        print("远程路径可能不存在或为空。")
         return {}
     remote_md5_dict = {}
     for line in output.split('\n'):
         parts = line.split()
         if len(parts) >= 2:
-            md5_value = parts[0]
-            file_path = os.path.join(remote_path, parts[1])  # Assuming the second part is the file name
-            remote_md5_dict[md5_value] = file_path
-            logging.info(f"远程文件MD5：{file_path} - {md5_value}")
+            remote_md5_dict[parts[0]] = parts[1]  # Store the MD5 as key and the file path as value
     return remote_md5_dict
 
-def compare_and_backup(local_path, remote_name, remote_path, local_md5, remote_md5):
+def compare_and_backup(local_path, remote_name, remote_base_path, local_md5, remote_md5):
     """比较本地和远程文件的 MD5 值并备份不一致的文件"""
+    ensure_remote_dirs(remote_name, local_path, remote_base_path)  # 确保远程目录存在
     if remote_md5 is None:
-        logging.info("远程目录为空，执行备份所有本地文件。")
-        backup_cmd = ['copy', '--progress', '--transfers=10', local_path, f'{remote_name}:{remote_path}']
+        print("远程目录为空，执行备份所有本地文件。")
+        backup_cmd = ['copy', '--progress', '--transfers=30', local_path, f'{remote_name}:{remote_base_path}']
         run_rclone_command(backup_cmd)
         return
 
-    for local_md5_value, local_file_path in local_md5.items():
+    for local_md5_value, file_path in local_md5.items():
         if local_md5_value not in remote_md5:
-            logging.info(f"文件 MD5 值 {local_md5_value} 在远程不存在，执行备份：{local_file_path}")
-            file_backup_cmd = ['copy', '--progress', '--transfers=10', local_file_path, f'{remote_name}:{remote_path}']
-            result = run_rclone_command(file_backup_cmd)
-            if result is not None and result.returncode == 0:
-                logging.info(f"备份成功：{local_file_path}")
-            else:
-                logging.error(f"备份失败：{local_file_path}")
+            print(f"文件 MD5 值 {local_md5_value} 在远程不存在，执行备份。")
+            # 获取文件的父目录路径
+            file_dir_path = os.path.dirname(file_path)
+            # 获取文件名
+            file_name = os.path.basename(file_path)
+            # 构建远程文件的父目录路径，不包含文件名
+            remote_file_dir_path = os.path.normpath(os.path.join(remote_base_path, os.path.relpath(file_dir_path, local_path)))
+            file_backup_cmd = ['copy', '--progress', '--transfers=30', file_path, f'{remote_name}:{remote_file_dir_path}']
+            run_rclone_command(file_backup_cmd)
         else:
-            logging.info(f"文件 MD5 值 {local_md5_value} 匹配，跳过备份：{local_file_path}")
+            print(f"文件 MD5 值 {local_md5_value} 匹配，跳过备份。")
 def main():
     logging.info("备份工具开始运行。")
     print("备份工具")
@@ -172,7 +217,7 @@ def main():
             user = input("请输入您的账户：")
             password = input("请输入您的密码：")
             password_obscured = obscure_password(password)
-            remote_path = input("请输入服务器上的目的地路径：")
+            remote_path = input("请输入服务器上的目的地路径：")  # 获取远程路径
             local_path = input("请输入需要备份的本地路径：")
             config_data = {remote_name: {
                 'type': type,
@@ -203,7 +248,7 @@ def main():
         user = input("请输入您的账户：")
         password = input("请输入您的密码：")
         password_obscured = obscure_password(password)
-        remote_path = input("请输入服务器上的目的地路径：")
+        remote_path = input("请输入服务器上的目的地路径：")  # 获取远程路径
         local_path = input("请输入需要备份的本地路径：")
         config_data = {remote_name: {
             'type': type,
@@ -223,27 +268,30 @@ def main():
 
         # 比较并备份不一致的文件
         compare_and_backup(local_path, remote_name, remote_path, local_md5, remote_md5)
+        logging.info("开始新的备份周期。")
+        # 计算本地文件的 MD5 值
+        local_md5 = calculate_local_md5(local_path)
 
-    try:
-        while True:  # 创建一个无限循环
-            logging.info("开始新的备份周期。")
-            # 计算本地文件的 MD5 值
-            local_md5 = calculate_local_md5(local_path)
+        # 获取远程文件的 MD5 值
+        remote_md5 = get_remote_md5(remote_name, remote_path)
 
-            # 获取远程文件的 MD5 值
-            remote_md5 = get_remote_md5(remote_name, remote_path)
+        # 比较并备份不一致的文件
+        compare_and_backup(local_path, remote_name, remote_path, local_md5, remote_md5)
+    while True:  # 创建一个无限循环
+        logging.info("开始新的备份周期。")
+        # 计算本地文件的 MD5 值
+        local_md5 = calculate_local_md5(local_path)
 
-            # 比较并备份不一致的文件
-            compare_and_backup(local_path, remote_name, remote_path, local_md5, remote_md5)
+        # 获取远程文件的 MD5 值
+        remote_md5 = get_remote_md5(remote_name, remote_path)
 
-            # 等待600秒（10分钟）后再次执行
-            print("等待10分钟...")
-            time.sleep(32000)
-            logging.info("备份周期完成，等待下一个周期。")
-    except KeyboardInterrupt:
-        logging.info("程序被用户中断。")
-    finally:
-        logging.info("程序结束运行。")
+        # 比较并备份不一致的文件
+        compare_and_backup(local_path, remote_name, remote_path, local_md5, remote_md5)
+
+        # 等待600秒（10分钟）后再次执行
+        print("等待10分钟...")
+        time.sleep(20)
+        logging.info("备份周期完成，等待下一个周期。")
 
 if __name__ == "__main__":
     main()
